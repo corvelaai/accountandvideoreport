@@ -1,0 +1,792 @@
+const express = require("express");
+const crypto = require("crypto");
+
+const router = express.Router();
+
+/*
+ * TikTok Reporting / Case Management Service
+ *
+ * Responsibilities:
+ *   1. Create evidence-backed moderation cases
+ *   2. Deduplicate reports
+ *   3. Route cases to human review
+ *   4. Support manual submission
+ *   5. Support an authorized TikTok integration adapter
+ *   6. Track requested account actions
+ *   7. Maintain an audit trail
+ 
+
+class TikTokReportingService {
+  constructor() {
+    this.cases = new Map();
+    this.auditLog = [];
+    this.reportingQueue = [];
+  }
+
+  generateCaseId() {
+    return `TT-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  }
+
+  hashEvidence(data) {
+    return crypto
+      .createHash("sha256")
+      .update(JSON.stringify(data))
+      .digest("hex");
+  }
+
+  validateUrl(url) {
+    try {
+      const parsed = new URL(url);
+
+      if (
+        parsed.hostname !== "www.tiktok.com" &&
+        parsed.hostname !== "tiktok.com"
+      ) {
+        return false;
+      }
+
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  createCase(input) {
+    if (!input.contentUrl) {
+      throw new Error("contentUrl is required");
+    }
+
+    if (!this.validateUrl(input.contentUrl)) {
+      throw new Error("Invalid TikTok URL");
+    }
+
+    if (!input.classification) {
+      throw new Error("classification is required");
+    }
+
+    const evidence = {
+      contentUrl: input.contentUrl,
+      accountUrl: input.accountUrl || null,
+      contentId: input.contentId || null,
+      accountId: input.accountId || null,
+
+      classification: input.classification,
+      confidenceScore: input.confidenceScore ?? null,
+
+      summary: input.summary || "",
+      reasoning: input.reasoning || "",
+
+      detectedAt:
+        input.detectedAt || new Date().toISOString(),
+
+      source: input.source || "intelligence-monitor"
+    };
+
+    const evidenceHash = this.hashEvidence(evidence);
+
+    /*
+     * Prevent duplicate submissions for identical evidence.
+     */
+    const existing = [...this.cases.values()].find(
+      c => c.evidenceHash === evidenceHash
+    );
+
+    if (existing) {
+      return existing;
+    }
+
+    const caseId = this.generateCaseId();
+
+    const moderationCase = {
+      caseId,
+
+      platform: "tiktok",
+
+      status: "PENDING_REVIEW",
+
+      action: "REPORT_CONTENT",
+
+      evidence,
+
+      evidenceHash,
+
+      createdAt: new Date().toISOString(),
+
+      review: {
+        required: true,
+        reviewer: null,
+        reviewedAt: null,
+        decision: null,
+        notes: null
+      },
+
+      submission: {
+        method: null,
+        submittedAt: null,
+        referenceId: null,
+        status: "NOT_SUBMITTED"
+      },
+
+      enforcement: {
+        requested: false,
+        requestedAction: null,
+        decision: null,
+        decidedAt: null
+      }
+    };
+
+    this.cases.set(caseId, moderationCase);
+
+    this.audit(
+      "CASE_CREATED",
+      caseId,
+      {
+        classification: input.classification,
+        confidenceScore: input.confidenceScore
+      }
+    );
+
+    return moderationCase;
+  }
+
+  reviewCase(caseId, reviewer, decision, notes = "") {
+    const caseData = this.getCase(caseId);
+
+    if (!reviewer) {
+      throw new Error("Reviewer identity is required");
+    }
+
+    if (!["APPROVE", "REJECT", "ESCALATE"].includes(decision)) {
+      throw new Error("Invalid review decision");
+    }
+
+    caseData.review = {
+      required: true,
+      reviewer,
+      reviewedAt: new Date().toISOString(),
+      decision,
+      notes
+    };
+
+    if (decision === "APPROVE") {
+      caseData.status = "READY_FOR_SUBMISSION";
+    } else if (decision === "ESCALATE") {
+      caseData.status = "ESCALATED";
+    } else {
+      caseData.status = "REJECTED";
+    }
+
+    this.audit(
+      "CASE_REVIEWED",
+      caseId,
+      {
+        reviewer,
+        decision
+      }
+    );
+
+    return caseData;
+  }
+
+  /*
+   * Manual submission workflow.
+   *
+   * This does not pretend to submit to TikTok.
+   * It creates the exact package the authorized operator
+   * needs to submit through TikTok's supported reporting channel.
+   */
+  prepareManualSubmission(caseId) {
+    const caseData = this.getCase(caseId);
+
+    if (caseData.status !== "READY_FOR_SUBMISSION") {
+      throw new Error(
+        "Case must be approved before submission"
+      );
+    }
+
+    const submissionPackage = {
+      caseId,
+
+      platform: "TikTok",
+
+      contentUrl: caseData.evidence.contentUrl,
+
+      accountUrl: caseData.evidence.accountUrl,
+
+      classification: caseData.evidence.classification,
+
+      confidenceScore:
+        caseData.evidence.confidenceScore,
+
+      summary: caseData.evidence.summary,
+
+      reasoning: caseData.evidence.reasoning,
+
+      detectedAt: caseData.evidence.detectedAt,
+
+      evidenceHash: caseData.evidenceHash,
+
+      generatedAt: new Date().toISOString()
+    };
+
+    this.audit(
+      "MANUAL_SUBMISSION_PACKAGE_CREATED",
+      caseId,
+      {}
+    );
+
+    return submissionPackage;
+  }
+
+  /*
+   * Mark a manually submitted case.
+   *
+   * The operator enters the reference/confirmation received
+   * from the official TikTok reporting interface.
+   */
+  recordManualSubmission(
+    caseId,
+    operator,
+    referenceId
+  ) {
+    const caseData = this.getCase(caseId);
+
+    if (!operator) {
+      throw new Error("Operator identity required");
+    }
+
+    caseData.submission = {
+      method: "manual",
+      submittedAt: new Date().toISOString(),
+      referenceId: referenceId || null,
+      status: "SUBMITTED"
+    };
+
+    caseData.status = "SUBMITTED";
+
+    this.audit(
+      "MANUAL_REPORT_SUBMITTED",
+      caseId,
+      {
+        operator,
+        referenceId
+      }
+    );
+
+    return caseData;
+  }
+
+  /*
+   * Automated submission.
+   *
+   * This deliberately requires an official integration adapter.
+   * Do not automate the TikTok UI by defeating CAPTCHA,
+   * authentication, anti-bot controls, or other platform controls.
+   */
+  async submitThroughAuthorizedAdapter(
+    caseId,
+    adapter,
+    operator
+  ) {
+    const caseData = this.getCase(caseId);
+
+    if (caseData.status !== "READY_FOR_SUBMISSION") {
+      throw new Error(
+        "Case must be approved before automated submission"
+      );
+    }
+
+    if (!adapter || typeof adapter.submitReport !== "function") {
+      throw new Error(
+        "No authorized TikTok reporting adapter configured"
+      );
+    }
+
+    const result = await adapter.submitReport({
+      platform: "tiktok",
+
+      contentUrl: caseData.evidence.contentUrl,
+
+      accountUrl: caseData.evidence.accountUrl,
+
+      classification: caseData.evidence.classification,
+
+      summary: caseData.evidence.summary,
+
+      reasoning: caseData.evidence.reasoning,
+
+      evidenceHash: caseData.evidenceHash
+    });
+
+    caseData.submission = {
+      method: "authorized_integration",
+      submittedAt: new Date().toISOString(),
+      referenceId: result.referenceId || null,
+      status: result.success
+        ? "SUBMITTED"
+        : "FAILED"
+    };
+
+    caseData.status = result.success
+      ? "SUBMITTED"
+      : "SUBMISSION_FAILED";
+
+    this.audit(
+      "AUTOMATED_REPORT_ATTEMPT",
+      caseId,
+      {
+        operator,
+        result
+      }
+    );
+
+    return caseData;
+  }
+
+  /*
+   * Account-level action request.
+   *
+   * This creates an enforcement request; it does not
+   * directly disable/delete the TikTok account.
+   */
+  requestAccountAction(
+    caseId,
+    action,
+    reason,
+    operator
+  ) {
+    const caseData = this.getCase(caseId);
+
+    const allowedActions = [
+      "ACCOUNT_REVIEW",
+      "ACCOUNT_RESTRICTION_REVIEW",
+      "ACCOUNT_TAKEDOWN_REVIEW"
+    ];
+
+    if (!allowedActions.includes(action)) {
+      throw new Error("Invalid account action");
+    }
+
+    if (!caseData.evidence.accountUrl) {
+      throw new Error(
+        "accountUrl is required for account-level action"
+      );
+    }
+
+    if (!operator) {
+      throw new Error("Operator identity required");
+    }
+
+    caseData.enforcement = {
+      requested: true,
+
+      requestedAction: action,
+
+      decision: "PENDING_PLATFORM_REVIEW",
+
+      reason,
+
+      requestedBy: operator,
+
+      requestedAt: new Date().toISOString()
+    };
+
+    caseData.status = "ACCOUNT_ACTION_REQUESTED";
+
+    this.audit(
+      "ACCOUNT_ACTION_REQUESTED",
+      caseId,
+      {
+        action,
+        operator
+      }
+    );
+
+    return caseData;
+  }
+
+  /*
+   * Record TikTok's actual decision.
+   */
+  recordPlatformDecision(
+    caseId,
+    decision,
+    referenceId,
+    notes = ""
+  ) {
+    const caseData = this.getCase(caseId);
+
+    const allowed = [
+      "CONTENT_REMOVED",
+      "CONTENT_RETAINED",
+      "ACCOUNT_RESTRICTED",
+      "ACCOUNT_BANNED",
+      "NO_VIOLATION",
+      "PENDING"
+    ];
+
+    if (!allowed.includes(decision)) {
+      throw new Error("Invalid platform decision");
+    }
+
+    caseData.enforcement.decision = decision;
+
+    caseData.enforcement.decidedAt =
+      new Date().toISOString();
+
+    caseData.enforcement.referenceId =
+      referenceId || null;
+
+    caseData.enforcement.notes = notes;
+
+    caseData.status = decision === "PENDING"
+      ? "PENDING_PLATFORM_REVIEW"
+      : "RESOLVED";
+
+    this.audit(
+      "PLATFORM_DECISION_RECORDED",
+      caseId,
+      {
+        decision,
+        referenceId
+      }
+    );
+
+    return caseData;
+  }
+
+  getCase(caseId) {
+    const caseData = this.cases.get(caseId);
+
+    if (!caseData) {
+      throw new Error(`Case not found: ${caseId}`);
+    }
+
+    return caseData;
+  }
+
+  getCases(filters = {}) {
+    let cases = [...this.cases.values()];
+
+    if (filters.status) {
+      cases = cases.filter(
+        c => c.status === filters.status
+      );
+    }
+
+    if (filters.classification) {
+      cases = cases.filter(
+        c =>
+          c.evidence.classification ===
+          filters.classification
+      );
+    }
+
+    return cases;
+  }
+
+  audit(event, caseId, metadata) {
+    this.auditLog.push({
+      event,
+
+      caseId,
+
+      timestamp: new Date().toISOString(),
+
+      metadata
+    });
+  }
+
+  getAuditLog(caseId = null) {
+    if (!caseId) {
+      return this.auditLog;
+    }
+
+    return this.auditLog.filter(
+      entry => entry.caseId === caseId
+    );
+  }
+}
+
+const reportingService =
+  new TikTokReportingService();
+
+
+/*
+ * CREATE CASE
+ *
+ * Your intelligence engine calls this after detection.
+ */
+router.post("/cases", async (req, res) => {
+  try {
+    const moderationCase =
+      reportingService.createCase(req.body);
+
+    res.status(201).json({
+      success: true,
+      case: moderationCase
+    });
+
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+
+/*
+ * HUMAN REVIEW
+ */
+router.post(
+  "/cases/:caseId/review",
+  async (req, res) => {
+    try {
+      const {
+        reviewer,
+        decision,
+        notes
+      } = req.body;
+
+      const result =
+        reportingService.reviewCase(
+          req.params.caseId,
+          reviewer,
+          decision,
+          notes
+        );
+
+      res.json({
+        success: true,
+        case: result
+      });
+
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * PREPARE MANUAL REPORT
+ */
+router.get(
+  "/cases/:caseId/manual-package",
+  async (req, res) => {
+    try {
+      const packageData =
+        reportingService.prepareManualSubmission(
+          req.params.caseId
+        );
+
+      res.json({
+        success: true,
+        submission: packageData
+      });
+
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * RECORD MANUAL SUBMISSION
+ */
+router.post(
+  "/cases/:caseId/manual-submission",
+  async (req, res) => {
+    try {
+      const {
+        operator,
+        referenceId
+      } = req.body;
+
+      const result =
+        reportingService.recordManualSubmission(
+          req.params.caseId,
+          operator,
+          referenceId
+        );
+
+      res.json({
+        success: true,
+        case: result
+      });
+
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * REQUEST ACCOUNT ACTION
+ */
+router.post(
+  "/cases/:caseId/account-action",
+  async (req, res) => {
+    try {
+      const {
+        action,
+        reason,
+        operator
+      } = req.body;
+
+      const result =
+        reportingService.requestAccountAction(
+          req.params.caseId,
+          action,
+          reason,
+          operator
+        );
+
+      res.json({
+        success: true,
+        case: result
+      });
+
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * RECORD PLATFORM DECISION
+ */
+router.post(
+  "/cases/:caseId/platform-decision",
+  async (req, res) => {
+    try {
+      const {
+        decision,
+        referenceId,
+        notes
+      } = req.body;
+
+      const result =
+        reportingService.recordPlatformDecision(
+          req.params.caseId,
+          decision,
+          referenceId,
+          notes
+        );
+
+      res.json({
+        success: true,
+        case: result
+      });
+
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * GET CASE
+ */
+router.get(
+  "/cases/:caseId",
+  (req, res) => {
+    try {
+      const result =
+        reportingService.getCase(
+          req.params.caseId
+        );
+
+      res.json({
+        success: true,
+        case: result
+      });
+
+    } catch (error) {
+      res.status(404).json({
+        success: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+/*
+ * LIST CASES
+ */
+router.get("/cases", (req, res) => {
+  const cases =
+    reportingService.getCases({
+      status: req.query.status,
+      classification:
+        req.query.classification
+    });
+
+  res.json({
+    success: true,
+    count: cases.length,
+    cases
+  });
+});
+
+
+/*
+ * AUDIT LOG
+ */
+router.get(
+  "/cases/:caseId/audit",
+  (req, res) => {
+    res.json({
+      success: true,
+      audit:
+        reportingService.getAuditLog(
+          req.params.caseId
+        )
+    });
+  }
+);
+
+
+/*
+ * HEALTH
+ */
+router.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "TikTok Intelligence Reporting",
+    capabilities: [
+      "case_creation",
+      "human_review",
+      "manual_reporting",
+      "authorized_automated_reporting",
+      "account_action_requests",
+      "platform_decision_tracking",
+      "audit_logging"
+    ],
+    timestamp: new Date().toISOString()
+  });
+});
+
+
+module.exports = router;
