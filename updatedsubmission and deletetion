@@ -1,0 +1,1868 @@
+const express = require("express");
+const crypto = require("crypto");
+
+const router = express.Router();
+
+/*
+ * TikTok Intelligence Reporting Queue
+ *
+ * Workflow:
+ *
+ *   DETECTION
+ *      ↓
+ *   CASE CREATION
+ *      ↓
+ *   HUMAN REVIEW
+ *      ↓
+ *   REPORTING QUEUE
+ *      ↓
+ *   AUTHORIZED SUBMISSION
+ *      ↓
+ *   PLATFORM DECISION
+ */
+
+const CONFIG = {
+  maxAttempts: Number(
+    process.env.TIKTOK_MAX_ATTEMPTS || 3
+  ),
+
+  retryDelayMs: Number(
+    process.env.TIKTOK_RETRY_DELAY_MS || 5000
+  ),
+
+  workerIntervalMs: Number(
+    process.env.TIKTOK_WORKER_INTERVAL_MS || 500
+  ),
+
+  maxConcurrentJobs: Number(
+    process.env.TIKTOK_MAX_CONCURRENT || 5
+  ),
+
+  automaticSubmission:
+    process.env.TIKTOK_AUTOMATIC_SUBMISSION === "true",
+
+  requireHumanReview:
+    process.env.TIKTOK_REQUIRE_HUMAN_REVIEW !== "false"
+};
+
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+function sha256(value) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(value))
+    .digest("hex");
+}
+
+
+function generateCaseId() {
+  return (
+    "TT-" +
+    Date.now() +
+    "-" +
+    crypto.randomBytes(4).toString("hex")
+  );
+}
+
+
+/* =========================================================
+   REPORTING QUEUE
+   ========================================================= */
+
+class TikTokReportingQueue {
+
+  constructor(adapter = null) {
+
+    this.adapter = adapter;
+
+    this.cases = new Map();
+
+    this.queue = [];
+
+    this.audit = [];
+
+    this.running = false;
+
+    this.activeWorkers = 0;
+
+    this.workerTimer = null;
+  }
+
+
+  /* ---------------------------------------------------------
+     ADAPTER
+     --------------------------------------------------------- */
+
+  setAdapter(adapter) {
+
+    if (
+      adapter &&
+      typeof adapter.submitReport !== "function"
+    ) {
+      throw new Error(
+        "Adapter must implement submitReport(payload)"
+      );
+    }
+
+    this.adapter = adapter;
+  }
+
+
+  /* ---------------------------------------------------------
+     AUDIT
+     --------------------------------------------------------- */
+
+  log(event, caseId, metadata = {}) {
+
+    this.audit.push({
+
+      event,
+
+      caseId,
+
+      timestamp:
+        new Date().toISOString(),
+
+      metadata
+    });
+  }
+
+
+  /* ---------------------------------------------------------
+     URL VALIDATION
+     --------------------------------------------------------- */
+
+  validateTikTokUrl(value) {
+
+    try {
+
+      const url = new URL(value);
+
+      return [
+        "tiktok.com",
+        "www.tiktok.com",
+        "m.tiktok.com"
+      ].includes(url.hostname);
+
+    } catch {
+
+      return false;
+    }
+  }
+
+
+  /* =========================================================
+     CREATE CASE
+     ========================================================= */
+
+  createCase(data) {
+
+    if (!data.contentUrl) {
+
+      throw new Error(
+        "contentUrl is required"
+      );
+    }
+
+
+    if (!this.validateTikTokUrl(data.contentUrl)) {
+
+      throw new Error(
+        "Invalid TikTok URL"
+      );
+    }
+
+
+    if (!data.classification) {
+
+      throw new Error(
+        "classification is required"
+      );
+    }
+
+
+    const evidence = {
+
+      contentUrl:
+        data.contentUrl,
+
+      accountUrl:
+        data.accountUrl || null,
+
+      contentId:
+        data.contentId || null,
+
+      accountId:
+        data.accountId || null,
+
+      classification:
+        data.classification,
+
+      confidenceScore:
+        Number(
+          data.confidenceScore ?? 0
+        ),
+
+      summary:
+        data.summary || "",
+
+      reasoning:
+        data.reasoning || "",
+
+      detectedAt:
+        data.detectedAt ||
+        new Date().toISOString(),
+
+      source:
+        data.source ||
+        "intelligence-monitor",
+
+      evidenceReferences:
+        data.evidenceReferences || []
+    };
+
+
+    const evidenceHash =
+      sha256(evidence);
+
+
+    /*
+     * Prevent duplicate reports.
+     */
+
+    for (
+      const existing
+      of this.cases.values()
+    ) {
+
+      if (
+        existing.evidenceHash ===
+        evidenceHash
+      ) {
+
+        return {
+
+          duplicate: true,
+
+          case: existing
+        };
+      }
+    }
+
+
+    const id =
+      generateCaseId();
+
+
+    const record = {
+
+      id,
+
+      platform:
+        "tiktok",
+
+
+      status:
+        CONFIG.requireHumanReview
+          ? "PENDING_REVIEW"
+          : "READY_FOR_SUBMISSION",
+
+
+      evidence,
+
+      evidenceHash,
+
+
+      attempts:
+        0,
+
+
+      submission: {
+
+        method:
+          null,
+
+        status:
+          "NOT_SUBMITTED",
+
+        referenceId:
+          null,
+
+        submittedAt:
+          null
+      },
+
+
+      review: {
+
+        required:
+          CONFIG.requireHumanReview,
+
+        reviewer:
+          null,
+
+        decision:
+          null,
+
+        reviewedAt:
+          null,
+
+        notes:
+          null
+      },
+
+
+      accountAction: {
+
+        requested:
+          false,
+
+        action:
+          null,
+
+        status:
+          "NOT_REQUESTED",
+
+        reason:
+          null
+      },
+
+
+      createdAt:
+        new Date().toISOString(),
+
+      updatedAt:
+        new Date().toISOString()
+    };
+
+
+    this.cases.set(
+      id,
+      record
+    );
+
+
+    this.log(
+      "CASE_CREATED",
+      id,
+      {
+
+        classification:
+          evidence.classification,
+
+        confidenceScore:
+          evidence.confidenceScore
+      }
+    );
+
+
+    /*
+     * If human review has been disabled,
+     * send directly to the queue.
+     */
+
+    if (
+      !CONFIG.requireHumanReview
+    ) {
+
+      this.enqueue(id);
+    }
+
+
+    return {
+
+      duplicate:
+        false,
+
+      case:
+        record
+    };
+  }
+
+
+  /* =========================================================
+     HUMAN REVIEW
+     ========================================================= */
+
+  review(
+    id,
+    reviewer,
+    decision,
+    notes = ""
+  ) {
+
+    const record =
+      this.get(id);
+
+
+    if (!reviewer) {
+
+      throw new Error(
+        "reviewer is required"
+      );
+    }
+
+
+    if (
+      ![
+        "APPROVE",
+        "REJECT",
+        "ESCALATE"
+      ].includes(decision)
+    ) {
+
+      throw new Error(
+        "Invalid review decision"
+      );
+    }
+
+
+    record.review = {
+
+      required:
+        true,
+
+      reviewer,
+
+      decision,
+
+      reviewedAt:
+        new Date().toISOString(),
+
+      notes
+    };
+
+
+    if (
+      decision === "APPROVE"
+    ) {
+
+      record.status =
+        "READY_FOR_SUBMISSION";
+
+
+      this.log(
+        "CASE_APPROVED",
+        id,
+        {
+          reviewer
+        }
+      );
+
+
+      this.enqueue(id);
+
+    }
+
+
+    else if (
+      decision === "REJECT"
+    ) {
+
+      record.status =
+        "REJECTED";
+
+
+      this.log(
+        "CASE_REJECTED",
+        id,
+        {
+          reviewer
+        }
+      );
+    }
+
+
+    else {
+
+      record.status =
+        "ESCALATED";
+
+
+      this.log(
+        "CASE_ESCALATED",
+        id,
+        {
+          reviewer
+        }
+      );
+    }
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    return record;
+  }
+
+
+  /* =========================================================
+     QUEUE
+     ========================================================= */
+
+  enqueue(id) {
+
+    const record =
+      this.get(id);
+
+
+    if (
+      ![
+        "READY_FOR_SUBMISSION",
+        "SUBMISSION_FAILED"
+      ].includes(record.status)
+    ) {
+
+      throw new Error(
+        `Case ${id} cannot be queued from ${record.status}`
+      );
+    }
+
+
+    /*
+     * Prevent duplicate jobs.
+     */
+
+    if (
+      this.queue.some(
+        job =>
+          job.caseId === id
+      )
+    ) {
+
+      return {
+
+        queued:
+          false,
+
+        reason:
+          "already_queued"
+      };
+    }
+
+
+    this.queue.push({
+
+      caseId:
+        id,
+
+      queuedAt:
+        Date.now()
+    });
+
+
+    record.status =
+      "QUEUED";
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    this.log(
+      "CASE_QUEUED",
+      id
+    );
+
+
+    return {
+
+      queued:
+        true,
+
+      queueDepth:
+        this.queue.length
+    };
+  }
+
+
+  /* =========================================================
+     WORKER START
+     ========================================================= */
+
+  start() {
+
+    if (this.running) {
+
+      return;
+    }
+
+
+    this.running =
+      true;
+
+
+    this.workerTimer =
+      setInterval(
+        () =>
+          this.processQueue(),
+
+        CONFIG.workerIntervalMs
+      );
+
+
+    console.log(
+      "[TikTok Queue] Worker started"
+    );
+  }
+
+
+  /* =========================================================
+     WORKER STOP
+     ========================================================= */
+
+  stop() {
+
+    this.running =
+      false;
+
+
+    if (this.workerTimer) {
+
+      clearInterval(
+        this.workerTimer
+      );
+
+      this.workerTimer =
+        null;
+    }
+
+
+    console.log(
+      "[TikTok Queue] Worker stopped"
+    );
+  }
+
+
+  /* =========================================================
+     PROCESS QUEUE
+     ========================================================= */
+
+  async processQueue() {
+
+    if (!this.running) {
+
+      return;
+    }
+
+
+    while (
+
+      this.activeWorkers <
+        CONFIG.maxConcurrentJobs &&
+
+      this.queue.length > 0
+
+    ) {
+
+      const job =
+        this.queue.shift();
+
+
+      this.activeWorkers++;
+
+
+      this.processJob(job)
+
+        .catch(error => {
+
+          console.error(
+            "[TikTok Queue] Worker error:",
+            error.message
+          );
+
+        })
+
+        .finally(() => {
+
+          this.activeWorkers--;
+
+        });
+    }
+  }
+
+
+  /* =========================================================
+     PROCESS JOB
+     ========================================================= */
+
+  async processJob(job) {
+
+    const record =
+      this.get(job.caseId);
+
+
+    /*
+     * Automated submission must be explicitly enabled.
+     */
+
+    if (
+      !CONFIG.automaticSubmission
+    ) {
+
+      record.status =
+        "READY_FOR_MANUAL_SUBMISSION";
+
+
+      record.updatedAt =
+        new Date().toISOString();
+
+
+      this.log(
+        "AUTOMATIC_SUBMISSION_DISABLED",
+        record.id
+      );
+
+
+      return;
+    }
+
+
+    /*
+     * Require an authorized adapter.
+     */
+
+    if (!this.adapter) {
+
+      record.status =
+        "WAITING_FOR_AUTHORIZED_ADAPTER";
+
+
+      record.updatedAt =
+        new Date().toISOString();
+
+
+      this.log(
+        "NO_AUTHORIZED_ADAPTER",
+        record.id
+      );
+
+
+      return;
+    }
+
+
+    await this.submit(record);
+  }
+
+
+  /* =========================================================
+     SUBMIT
+     ========================================================= */
+
+  async submit(record) {
+
+    record.attempts++;
+
+
+    record.status =
+      "SUBMITTING";
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    this.log(
+      "SUBMISSION_STARTED",
+      record.id,
+      {
+
+        attempt:
+          record.attempts
+      }
+    );
+
+
+    try {
+
+      const result =
+        await this.adapter.submitReport({
+
+          platform:
+            "tiktok",
+
+          contentUrl:
+            record.evidence.contentUrl,
+
+          accountUrl:
+            record.evidence.accountUrl,
+
+          classification:
+            record.evidence.classification,
+
+          confidenceScore:
+            record.evidence.confidenceScore,
+
+          summary:
+            record.evidence.summary,
+
+          reasoning:
+            record.evidence.reasoning,
+
+          evidenceHash:
+            record.evidenceHash,
+
+          caseId:
+            record.id
+        });
+
+
+      if (
+        !result ||
+        !result.success
+      ) {
+
+        throw new Error(
+          result?.error ||
+          "Reporting adapter returned failure"
+        );
+      }
+
+
+      record.submission = {
+
+        method:
+          "authorized_integration",
+
+        status:
+          "SUBMITTED",
+
+        referenceId:
+          result.referenceId ||
+          null,
+
+        submittedAt:
+          new Date().toISOString()
+      };
+
+
+      record.status =
+        "SUBMITTED";
+
+
+      record.updatedAt =
+        new Date().toISOString();
+
+
+      this.log(
+        "SUBMISSION_SUCCESS",
+        record.id,
+        {
+
+          referenceId:
+            result.referenceId ||
+            null
+        }
+      );
+
+    }
+
+
+    catch (error) {
+
+      record.status =
+        "SUBMISSION_FAILED";
+
+
+      record.updatedAt =
+        new Date().toISOString();
+
+
+      this.log(
+        "SUBMISSION_FAILED",
+        record.id,
+        {
+
+          attempt:
+            record.attempts,
+
+          error:
+            error.message
+        }
+      );
+
+
+      /*
+       * Retry with exponential backoff.
+       */
+
+      if (
+        record.attempts <
+        CONFIG.maxAttempts
+      ) {
+
+        const delay =
+          CONFIG.retryDelayMs *
+          Math.pow(
+            2,
+            record.attempts - 1
+          );
+
+
+        await sleep(delay);
+
+
+        if (
+          record.status ===
+          "SUBMISSION_FAILED"
+        ) {
+
+          record.status =
+            "READY_FOR_SUBMISSION";
+
+
+          this.enqueue(
+            record.id
+          );
+        }
+
+      }
+
+
+      else {
+
+        record.status =
+          "MANUAL_INTERVENTION_REQUIRED";
+      }
+    }
+  }
+
+
+  /* =========================================================
+     MANUAL REPORT PACKAGE
+     ========================================================= */
+
+  manualPackage(id) {
+
+    const record =
+      this.get(id);
+
+
+    return {
+
+      caseId:
+        record.id,
+
+      platform:
+        "TikTok",
+
+      contentUrl:
+        record.evidence.contentUrl,
+
+      accountUrl:
+        record.evidence.accountUrl,
+
+      classification:
+        record.evidence.classification,
+
+      confidenceScore:
+        record.evidence.confidenceScore,
+
+      summary:
+        record.evidence.summary,
+
+      reasoning:
+        record.evidence.reasoning,
+
+      detectedAt:
+        record.evidence.detectedAt,
+
+      evidenceHash:
+        record.evidenceHash,
+
+      generatedAt:
+        new Date().toISOString()
+    };
+  }
+
+
+  /* =========================================================
+     RECORD MANUAL SUBMISSION
+     ========================================================= */
+
+  recordManualSubmission(
+    id,
+    operator,
+    referenceId
+  ) {
+
+    const record =
+      this.get(id);
+
+
+    if (!operator) {
+
+      throw new Error(
+        "operator is required"
+      );
+    }
+
+
+    record.submission = {
+
+      method:
+        "manual",
+
+      status:
+        "SUBMITTED",
+
+      referenceId:
+        referenceId ||
+        null,
+
+      submittedAt:
+        new Date().toISOString(),
+
+      operator
+    };
+
+
+    record.status =
+      "SUBMITTED";
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    this.log(
+      "MANUAL_SUBMISSION_RECORDED",
+      id,
+      {
+
+        operator,
+
+        referenceId
+      }
+    );
+
+
+    return record;
+  }
+
+
+  /* =========================================================
+     ACCOUNT ACTION
+     ========================================================= */
+
+  requestAccountReview(
+    id,
+    action,
+    reason,
+    operator
+  ) {
+
+    const record =
+      this.get(id);
+
+
+    if (
+      !record.evidence.accountUrl
+    ) {
+
+      throw new Error(
+        "accountUrl is required"
+      );
+    }
+
+
+    const allowed = [
+
+      "ACCOUNT_REVIEW",
+
+      "ACCOUNT_RESTRICTION_REVIEW",
+
+      "ACCOUNT_TAKEDOWN_REVIEW"
+
+    ];
+
+
+    if (
+      !allowed.includes(action)
+    ) {
+
+      throw new Error(
+        "Invalid account review action"
+      );
+    }
+
+
+    if (!operator) {
+
+      throw new Error(
+        "operator is required"
+      );
+    }
+
+
+    record.accountAction = {
+
+      requested:
+        true,
+
+      action,
+
+      status:
+        "PENDING_PLATFORM_REVIEW",
+
+      reason,
+
+      operator,
+
+      requestedAt:
+        new Date().toISOString()
+    };
+
+
+    record.status =
+      "ACCOUNT_ACTION_REQUESTED";
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    this.log(
+      "ACCOUNT_ACTION_REQUESTED",
+      id,
+      {
+
+        action,
+
+        operator
+      }
+    );
+
+
+    return record;
+  }
+
+
+  /* =========================================================
+     PLATFORM DECISION
+     ========================================================= */
+
+  recordPlatformDecision(
+    id,
+    decision,
+    referenceId,
+    notes = ""
+  ) {
+
+    const record =
+      this.get(id);
+
+
+    const allowed = [
+
+      "CONTENT_REMOVED",
+
+      "CONTENT_RETAINED",
+
+      "ACCOUNT_RESTRICTED",
+
+      "ACCOUNT_BANNED",
+
+      "NO_VIOLATION",
+
+      "PENDING"
+
+    ];
+
+
+    if (
+      !allowed.includes(decision)
+    ) {
+
+      throw new Error(
+        "Invalid platform decision"
+      );
+    }
+
+
+    if (
+      record.accountAction.requested
+    ) {
+
+      record.accountAction.status =
+        decision === "PENDING"
+          ? "PENDING_PLATFORM_REVIEW"
+          : "RESOLVED";
+
+
+      record.accountAction.platformDecision =
+        decision;
+
+
+      record.accountAction.decidedAt =
+        new Date().toISOString();
+    }
+
+
+    record.status =
+      decision === "PENDING"
+        ? "PENDING_PLATFORM_REVIEW"
+        : "RESOLVED";
+
+
+    record.updatedAt =
+      new Date().toISOString();
+
+
+    this.log(
+      "PLATFORM_DECISION_RECORDED",
+      id,
+      {
+
+        decision,
+
+        referenceId,
+
+        notes
+      }
+    );
+
+
+    return record;
+  }
+
+
+  /* =========================================================
+     GET CASE
+     ========================================================= */
+
+  get(id) {
+
+    const record =
+      this.cases.get(id);
+
+
+    if (!record) {
+
+      throw new Error(
+        `Case not found: ${id}`
+      );
+    }
+
+
+    return record;
+  }
+
+
+  /* =========================================================
+     LIST CASES
+     ========================================================= */
+
+  list(filters = {}) {
+
+    let result =
+      [...this.cases.values()];
+
+
+    if (filters.status) {
+
+      result =
+        result.filter(
+          item =>
+            item.status ===
+            filters.status
+        );
+    }
+
+
+    if (
+      filters.classification
+    ) {
+
+      result =
+        result.filter(
+          item =>
+            item.evidence
+              .classification ===
+            filters.classification
+        );
+    }
+
+
+    return result;
+  }
+
+
+  /* =========================================================
+     HISTORY
+     ========================================================= */
+
+  history(id) {
+
+    return this.audit.filter(
+      entry =>
+        entry.caseId === id
+    );
+  }
+
+
+  /* =========================================================
+     METRICS
+     ========================================================= */
+
+  metrics() {
+
+    const cases =
+      [...this.cases.values()];
+
+
+    const count =
+      status =>
+        cases.filter(
+          item =>
+            item.status ===
+            status
+        ).length;
+
+
+    return {
+
+      totalCases:
+        cases.length,
+
+      queueDepth:
+        this.queue.length,
+
+      activeWorkers:
+        this.activeWorkers,
+
+      pendingReview:
+        count("PENDING_REVIEW"),
+
+      queued:
+        count("QUEUED"),
+
+      submitting:
+        count("SUBMITTING"),
+
+      submitted:
+        count("SUBMITTED"),
+
+      failed:
+        count("SUBMISSION_FAILED"),
+
+      manualIntervention:
+        count(
+          "MANUAL_INTERVENTION_REQUIRED"
+        ),
+
+      resolved:
+        count("RESOLVED")
+    };
+  }
+}
+
+
+/* =========================================================
+   AUTHORIZED ADAPTER
+   ========================================================= */
+
+/*
+ * This is intentionally an interface.
+ *
+ * Connect this only to a legitimate, authorized TikTok
+ * reporting integration available to your organization.
+ */
+
+class AuthorizedTikTokAdapter {
+
+  async submitReport(payload) {
+
+    throw new Error(
+      "Configure an authorized TikTok reporting adapter"
+    );
+  }
+}
+
+
+/* =========================================================
+   INSTANCE
+   ========================================================= */
+
+const reportingQueue =
+  new TikTokReportingQueue(
+    new AuthorizedTikTokAdapter()
+  );
+
+
+reportingQueue.start();
+
+
+/* =========================================================
+   CREATE CASE
+   ========================================================= */
+
+router.post(
+  "/cases",
+  async (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.createCase(
+          req.body
+        );
+
+
+      res.status(
+        result.duplicate
+          ? 200
+          : 201
+      ).json({
+
+        success:
+          true,
+
+        ...result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(400).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   REVIEW CASE
+   ========================================================= */
+
+router.post(
+  "/cases/:caseId/review",
+  async (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.review(
+
+          req.params.caseId,
+
+          req.body.reviewer,
+
+          req.body.decision,
+
+          req.body.notes || ""
+        );
+
+
+      res.json({
+
+        success:
+          true,
+
+        case:
+          result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(400).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   MANUAL PACKAGE
+   ========================================================= */
+
+router.get(
+  "/cases/:caseId/manual-package",
+  (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.manualPackage(
+          req.params.caseId
+        );
+
+
+      res.json({
+
+        success:
+          true,
+
+        submission:
+          result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(404).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   MANUAL SUBMISSION
+   ========================================================= */
+
+router.post(
+  "/cases/:caseId/manual-submission",
+  (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.recordManualSubmission(
+
+          req.params.caseId,
+
+          req.body.operator,
+
+          req.body.referenceId
+        );
+
+
+      res.json({
+
+        success:
+          true,
+
+        case:
+          result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(400).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   ACCOUNT REVIEW
+   ========================================================= */
+
+router.post(
+  "/cases/:caseId/account-action",
+  (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.requestAccountReview(
+
+          req.params.caseId,
+
+          req.body.action,
+
+          req.body.reason,
+
+          req.body.operator
+        );
+
+
+      res.json({
+
+        success:
+          true,
+
+        case:
+          result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(400).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   PLATFORM DECISION
+   ========================================================= */
+
+router.post(
+  "/cases/:caseId/platform-decision",
+  (req, res) => {
+
+    try {
+
+      const result =
+        reportingQueue.recordPlatformDecision(
+
+          req.params.caseId,
+
+          req.body.decision,
+
+          req.body.referenceId,
+
+          req.body.notes || ""
+        );
+
+
+      res.json({
+
+        success:
+          true,
+
+        case:
+          result
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(400).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   GET CASE
+   ========================================================= */
+
+router.get(
+  "/cases/:caseId",
+  (req, res) => {
+
+    try {
+
+      res.json({
+
+        success:
+          true,
+
+        case:
+          reportingQueue.get(
+            req.params.caseId
+          )
+      });
+
+    }
+
+
+    catch (error) {
+
+      res.status(404).json({
+
+        success:
+          false,
+
+        error:
+          error.message
+      });
+    }
+  }
+);
+
+
+/* =========================================================
+   LIST CASES
+   ========================================================= */
+
+router.get(
+  "/cases",
+  (req, res) => {
+
+    res.json({
+
+      success:
+        true,
+
+      cases:
+        reportingQueue.list({
+
+          status:
+            req.query.status,
+
+          classification:
+            req.query.classification
+        })
+    });
+  }
+);
+
+
+/* =========================================================
+   AUDIT
+   ========================================================= */
+
+router.get(
+  "/cases/:caseId/audit",
+  (req, res) => {
+
+    res.json({
+
+      success:
+        true,
+
+      audit:
+        reportingQueue.history(
+          req.params.caseId
+        )
+    });
+  }
+);
+
+
+/* =========================================================
+   METRICS
+   ========================================================= */
+
+router.get(
+  "/metrics",
+  (req, res) => {
+
+    res.json({
+
+      success:
+        true,
+
+      metrics:
+        reportingQueue.metrics()
+    });
+  }
+);
+
+
+/* =========================================================
+   HEALTH
+   ========================================================= */
+
+router.get(
+  "/health",
+  (req, res) => {
+
+    res.json({
+
+      status:
+        "ok",
+
+      service:
+        "TikTok Intelligence Reporting Queue",
+
+      queueRunning:
+        reportingQueue.running,
+
+      automaticSubmission:
+        CONFIG.automaticSubmission,
+
+      humanReviewRequired:
+        CONFIG.requireHumanReview,
+
+      maxConcurrentJobs:
+        CONFIG.maxConcurrentJobs,
+
+      queueDepth:
+        reportingQueue.queue.length,
+
+      activeWorkers:
+        reportingQueue.activeWorkers,
+
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
+
+
+/* =========================================================
+   SHUTDOWN
+   ========================================================= */
+
+process.on(
+  "SIGINT",
+  () => {
+
+    reportingQueue.stop();
+
+    process.exit(0);
+  }
+);
+
+
+/* =========================================================
+   EXPORT
+   ========================================================= */
+
+module.exports = {
+
+  router,
+
+  reportingQueue,
+
+  AuthorizedTikTokAdapter
+};
